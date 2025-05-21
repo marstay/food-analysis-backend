@@ -77,6 +77,21 @@ def analyze_image_quality(image):
     }
 
 def analyze_food_image(image: np.ndarray) -> dict:
+    # Load model and get predictions
+    model, class_names = load_model()
+    preprocessed_image = preprocess_image(Image.fromarray(image))
+    predictions = model(preprocessed_image)[0]
+    
+    # Get top 3 predictions
+    top_3_idx = predictions.numpy().argsort()[-3:][::-1]
+    food_predictions = [
+        {
+            "name": class_names[idx].decode('utf-8'),
+            "confidence": float(predictions[idx]) * 100
+        }
+        for idx in top_3_idx
+    ]
+    
     # Analyze image quality
     quality_metrics = analyze_image_quality(image)
     
@@ -84,42 +99,90 @@ def analyze_food_image(image: np.ndarray) -> dict:
     is_safe = True
     confidence = 0.8
     issues = []
+    recommendations = []
     
-    # Check for signs of spoilage
+    # Detailed analysis of visual characteristics
+    analysis_details = {
+        "color_analysis": {
+            "saturation": quality_metrics['avg_saturation'],
+            "brightness": quality_metrics['avg_value'],
+            "color_variance": quality_metrics['color_variance']
+        },
+        "defects": {
+            "dark_spots": quality_metrics['dark_spot_percentage'],
+            "unusual_colors": quality_metrics['unusual_color_percentage']
+        },
+        "food_identification": {
+            "top_prediction": food_predictions[0],
+            "all_predictions": food_predictions
+        }
+    }
+    
+    # Check for signs of spoilage with more detailed thresholds
     if quality_metrics['dark_spot_percentage'] > 5:
         is_safe = False
         confidence *= 0.7
-        issues.append("Dark spots detected which might indicate mold or bacterial growth")
+        issues.append({
+            "type": "dark_spots",
+            "severity": "high" if quality_metrics['dark_spot_percentage'] > 10 else "medium",
+            "description": "Dark spots detected which might indicate mold or bacterial growth",
+            "percentage": round(quality_metrics['dark_spot_percentage'], 2)
+        })
+        recommendations.append("Inspect the food carefully for visible mold or discoloration")
     
     if quality_metrics['unusual_color_percentage'] > 10:
         is_safe = False
         confidence *= 0.8
-        issues.append("Unusual discoloration detected")
+        issues.append({
+            "type": "discoloration",
+            "severity": "high" if quality_metrics['unusual_color_percentage'] > 20 else "medium",
+            "description": "Unusual discoloration detected",
+            "percentage": round(quality_metrics['unusual_color_percentage'], 2)
+        })
+        recommendations.append("Check if the color is normal for this type of food")
     
     if quality_metrics['color_variance'] > 5000:
         is_safe = False
         confidence *= 0.85
-        issues.append("Inconsistent coloring detected")
+        issues.append({
+            "type": "inconsistent_coloring",
+            "severity": "medium",
+            "description": "Inconsistent coloring detected",
+            "variance": round(quality_metrics['color_variance'], 2)
+        })
+        recommendations.append("Look for any unusual color patterns or spots")
     
     if quality_metrics['avg_saturation'] < 50:
         is_safe = False
         confidence *= 0.9
-        issues.append("Low color saturation might indicate the food is past its prime")
+        issues.append({
+            "type": "low_saturation",
+            "severity": "low",
+            "description": "Low color saturation might indicate the food is past its prime",
+            "value": round(quality_metrics['avg_saturation'], 2)
+        })
+        recommendations.append("Check the expiration date and storage conditions")
     
     # Generate response message
     if is_safe:
-        message = "The food appears to be in good condition."
+        message = f"The {food_predictions[0]['name']} appears to be in good condition."
         details = "No significant signs of spoilage detected. However, always check expiration dates and proper storage conditions."
+        recommendations = ["Check the expiration date", "Verify proper storage conditions", "Look for any unusual odors"]
     else:
-        message = "The food shows signs that might indicate spoilage."
-        details = "Issues detected:\n" + "\n".join(f"- {issue}" for issue in issues)
+        message = f"The {food_predictions[0]['name']} shows signs that might indicate spoilage."
+        details = "Issues detected:\n" + "\n".join(f"- {issue['description']} (Severity: {issue['severity']})" for issue in issues)
+        details += "\n\nRecommendations:\n" + "\n".join(f"- {rec}" for rec in recommendations)
         details += "\n\nNote: This is an automated analysis. When in doubt, it's better to be safe than sorry."
     
     return {
         "isSafe": is_safe,
-        "confidence": confidence,
+        "confidence": round(confidence * 100, 2),
         "message": message,
-        "details": details
+        "details": details,
+        "analysis": analysis_details,
+        "issues": issues,
+        "recommendations": recommendations,
+        "identified_food": food_predictions[0]
     }
 
 @app.post("/analyze")
