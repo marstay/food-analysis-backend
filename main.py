@@ -23,21 +23,37 @@ if gpus:
     except RuntimeError as e:
         logger.warning(f"GPU memory growth setting failed: {e}")
 
-# Limit TensorFlow memory usage
-tf.config.set_logical_device_configuration(
-    tf.config.list_physical_devices('CPU')[0],
-    [tf.config.LogicalDeviceConfiguration(memory_limit=512)]  # Limit to 512MB
-)
+# Disable TensorFlow logging except for errors
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+# Configure TensorFlow to use less memory
+tf.config.optimizer.set_jit(True)  # Enable XLA compilation
+tf.config.optimizer.set_experimental_options({
+    "layout_optimizer": True,
+    "constant_folding": True,
+    "shape_optimization": True,
+    "remapping": True,
+    "arithmetic_optimization": True,
+    "dependency_optimization": True,
+    "loop_optimization": True,
+    "function_optimization": True,
+    "debug_stripper": True,
+    "disable_model_pruning": False,
+    "scoped_allocator_optimization": True,
+    "pin_to_host_optimization": True,
+    "implementation_selector": True,
+    "auto_mixed_precision": True
+})
 
 app = FastAPI()
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # Load model only once
@@ -50,15 +66,25 @@ def load_model():
         logger.info("Loading model...")
         start_time = time.time()
         try:
+            # Clear any existing model
+            if model is not None:
+                del model
+                gc.collect()
+            
+            # Load model with memory optimization
             model = hub.load("https://tfhub.dev/google/aiy/vision/classifier/food_V1/1")
             class_names = model.class_names
+            
+            # Optimize model
+            model = tf.function(model)
+            
             logger.info(f"Model loaded in {time.time() - start_time:.2f} seconds")
         except Exception as e:
             logger.error(f"Error loading model: {str(e)}")
             raise HTTPException(status_code=500, detail="Failed to load model")
     return model, class_names
 
-def preprocess_image(image_data: bytes, max_size: int = 512) -> np.ndarray:  # Reduced max size
+def preprocess_image(image_data: bytes, max_size: int = 384) -> np.ndarray:  # Further reduced max size
     try:
         # Open image from bytes
         image = Image.open(io.BytesIO(image_data))
@@ -75,7 +101,7 @@ def preprocess_image(image_data: bytes, max_size: int = 512) -> np.ndarray:  # R
         image = image.resize(new_size, Image.Resampling.LANCZOS)
         
         # Convert to numpy array and normalize
-        image_array = np.array(image) / 255.0
+        image_array = np.array(image, dtype=np.float32) / 255.0
         
         # Clear memory
         del image
