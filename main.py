@@ -1,144 +1,212 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from PIL import Image
-import io
-import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
-import cv2
-import os
-from dotenv import load_dotenv
+import numpy as np
+from PIL import Image
+import io
+import logging
+import time
 
-# Load environment variables
-load_dotenv()
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Configure CORS
+# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with your app's domain
+    allow_origins=["*"],  # Allows all origins
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
 )
 
-# Load the pre-trained model
+# Load model only once
 model = None
 class_names = None
 
 def load_model():
     global model, class_names
     if model is None:
-        # Load the model from TensorFlow Hub
-        model = hub.load('https://tfhub.dev/google/aiy/vision/classifier/food_V1/1')
-        # Load class names
+        logger.info("Loading model...")
+        start_time = time.time()
+        model = hub.load("https://tfhub.dev/google/aiy/vision/classifier/food_V1/1")
         class_names = model.class_names
+        logger.info(f"Model loaded in {time.time() - start_time:.2f} seconds")
     return model, class_names
 
-def preprocess_image(image):
-    # Resize image to model's expected size
-    image = image.resize((224, 224))
-    # Convert to numpy array and normalize
-    image = np.array(image) / 255.0
-    # Add batch dimension
-    image = np.expand_dims(image, axis=0)
-    return image
+def preprocess_image(image_data: bytes, max_size: int = 1024) -> np.ndarray:
+    try:
+        # Open image from bytes
+        image = Image.open(io.BytesIO(image_data))
+        
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
+        # Calculate new size maintaining aspect ratio
+        ratio = min(max_size / image.width, max_size / image.height)
+        new_size = (int(image.width * ratio), int(image.height * ratio))
+        
+        # Resize image
+        image = image.resize(new_size, Image.Resampling.LANCZOS)
+        
+        # Convert to numpy array and normalize
+        image_array = np.array(image) / 255.0
+        
+        # Add batch dimension
+        image_array = np.expand_dims(image_array, axis=0)
+        
+        return image_array
+    except Exception as e:
+        logger.error(f"Error preprocessing image: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Error processing image: {str(e)}")
 
-def analyze_image_quality(image):
-    # Convert to HSV color space
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    
-    # Calculate color statistics
-    saturation = hsv[:, :, 1]
-    value = hsv[:, :, 2]
-    
-    # Calculate average saturation and value
-    avg_saturation = np.mean(saturation)
-    avg_value = np.mean(value)
-    
-    # Calculate color variance (indicates discoloration)
-    color_variance = np.var(hsv[:, :, 0])
-    
-    # Detect dark spots (potential mold or spoilage)
-    dark_spots = cv2.threshold(value, 50, 255, cv2.THRESH_BINARY_INV)[1]
-    dark_spot_percentage = (np.sum(dark_spots) / 255) / (image.shape[0] * image.shape[1]) * 100
-    
-    # Detect unusual color patterns
-    unusual_colors = cv2.threshold(saturation, 150, 255, cv2.THRESH_BINARY)[1]
-    unusual_color_percentage = (np.sum(unusual_colors) / 255) / (image.shape[0] * image.shape[1]) * 100
-    
-    return {
-        'avg_saturation': avg_saturation,
-        'avg_value': avg_value,
-        'color_variance': color_variance,
-        'dark_spot_percentage': dark_spot_percentage,
-        'unusual_color_percentage': unusual_color_percentage
-    }
+def analyze_image_quality(image: np.ndarray) -> dict:
+    try:
+        # Convert to grayscale for some metrics
+        gray = np.mean(image, axis=-1)
+        
+        # Calculate color statistics
+        color_mean = np.mean(image, axis=(0, 1))
+        color_std = np.std(image, axis=(0, 1))
+        color_variance = np.var(image, axis=(0, 1))
+        
+        # Calculate brightness
+        brightness = np.mean(gray)
+        
+        # Calculate saturation
+        max_color = np.max(image, axis=-1)
+        min_color = np.min(image, axis=-1)
+        saturation = np.mean((max_color - min_color) / (max_color + 1e-6))
+        
+        # Detect dark spots (areas with very low brightness)
+        dark_spots = np.mean(gray < 0.2) * 100
+        
+        # Detect unusual colors (high variance in color channels)
+        unusual_colors = np.mean(color_variance > 0.1) * 100
+        
+        return {
+            "saturation": float(saturation),
+            "brightness": float(brightness),
+            "color_variance": float(np.mean(color_variance)),
+            "dark_spots": float(dark_spots),
+            "unusual_colors": float(unusual_colors)
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing image quality: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing image quality: {str(e)}")
 
 def analyze_food_image(image: np.ndarray) -> dict:
-    # Analyze image quality
-    quality_metrics = analyze_image_quality(image)
-    
-    # Initialize safety assessment
-    is_safe = True
-    confidence = 0.8
-    issues = []
-    
-    # Check for signs of spoilage
-    if quality_metrics['dark_spot_percentage'] > 5:
-        is_safe = False
-        confidence *= 0.7
-        issues.append("Dark spots detected which might indicate mold or bacterial growth")
-    
-    if quality_metrics['unusual_color_percentage'] > 10:
-        is_safe = False
-        confidence *= 0.8
-        issues.append("Unusual discoloration detected")
-    
-    if quality_metrics['color_variance'] > 5000:
-        is_safe = False
-        confidence *= 0.85
-        issues.append("Inconsistent coloring detected")
-    
-    if quality_metrics['avg_saturation'] < 50:
-        is_safe = False
-        confidence *= 0.9
-        issues.append("Low color saturation might indicate the food is past its prime")
-    
-    # Generate response message
-    if is_safe:
-        message = "The food appears to be in good condition."
-        details = "No significant signs of spoilage detected. However, always check expiration dates and proper storage conditions."
-    else:
-        message = "The food shows signs that might indicate spoilage."
-        details = "Issues detected:\n" + "\n".join(f"- {issue}" for issue in issues)
-        details += "\n\nNote: This is an automated analysis. When in doubt, it's better to be safe than sorry."
-    
-    return {
-        "isSafe": is_safe,
-        "confidence": confidence,
-        "message": message,
-        "details": details
-    }
+    try:
+        # Load model if not loaded
+        model, class_names = load_model()
+        
+        # Get predictions
+        predictions = model(image)
+        top_3_idx = np.argsort(predictions[0])[-3:][::-1]
+        
+        # Get top predictions
+        top_predictions = [
+            {
+                "name": class_names[idx].decode('utf-8'),
+                "confidence": float(predictions[0][idx] * 100)
+            }
+            for idx in top_3_idx
+        ]
+        
+        # Get image quality metrics
+        quality_metrics = analyze_image_quality(image)
+        
+        # Determine if food is safe based on quality metrics
+        is_safe = (
+            quality_metrics["dark_spots"] < 20 and
+            quality_metrics["unusual_colors"] < 30 and
+            quality_metrics["color_variance"] < 0.2
+        )
+        
+        # Calculate confidence based on quality metrics
+        confidence = 100 - (
+            quality_metrics["dark_spots"] * 0.4 +
+            quality_metrics["unusual_colors"] * 0.4 +
+            quality_metrics["color_variance"] * 100 * 0.2
+        )
+        confidence = max(0, min(100, confidence))
+        
+        # Generate message and recommendations
+        message = "This food appears to be in good condition." if is_safe else "This food shows signs of spoilage."
+        recommendations = []
+        
+        if quality_metrics["dark_spots"] > 10:
+            recommendations.append("Check for mold or dark spots")
+        if quality_metrics["unusual_colors"] > 20:
+            recommendations.append("Unusual discoloration detected")
+        if quality_metrics["color_variance"] > 0.15:
+            recommendations.append("Color appears inconsistent")
+            
+        return {
+            "isSafe": is_safe,
+            "confidence": float(confidence),
+            "message": message,
+            "identified_food": top_predictions[0],
+            "analysis": {
+                "color_analysis": {
+                    "saturation": quality_metrics["saturation"],
+                    "brightness": quality_metrics["brightness"],
+                    "color_variance": quality_metrics["color_variance"]
+                },
+                "defects": {
+                    "dark_spots": quality_metrics["dark_spots"],
+                    "unusual_colors": quality_metrics["unusual_colors"]
+                },
+                "food_identification": {
+                    "top_prediction": top_predictions[0],
+                    "all_predictions": top_predictions
+                }
+            },
+            "issues": [
+                {
+                    "severity": "high" if quality_metrics["dark_spots"] > 15 else "medium",
+                    "description": "Dark spots detected"
+                } if quality_metrics["dark_spots"] > 10 else None,
+                {
+                    "severity": "high" if quality_metrics["unusual_colors"] > 25 else "medium",
+                    "description": "Unusual discoloration"
+                } if quality_metrics["unusual_colors"] > 20 else None
+            ],
+            "recommendations": recommendations
+        }
+    except Exception as e:
+        logger.error(f"Error analyzing food image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error analyzing food image: {str(e)}")
 
 @app.post("/analyze")
 async def analyze_image(file: UploadFile = File(...)):
     try:
-        # Read and validate the image
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents))
+        logger.info(f"Received image: {file.filename}")
+        start_time = time.time()
         
-        # Convert to numpy array
-        image_array = np.array(image)
+        # Read image data
+        image_data = await file.read()
+        if not image_data:
+            raise HTTPException(status_code=400, detail="Empty image file")
+            
+        # Preprocess image
+        image_array = preprocess_image(image_data)
         
-        # Analyze the image
+        # Analyze image
         result = analyze_food_image(image_array)
         
+        logger.info(f"Analysis completed in {time.time() - start_time:.2f} seconds")
         return result
         
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 @app.get("/health")
 async def health_check():
