@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import tensorflow as tf
 import tensorflow_hub as hub
@@ -9,6 +9,11 @@ import logging
 import time
 import gc
 import os
+import asyncio
+from starlette.background import BackgroundTask
+from starlette.responses import Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +50,25 @@ tf.config.optimizer.set_experimental_options({
     "auto_mixed_precision": True
 })
 
+class TimeoutMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app: ASGIApp, timeout: int = 60):
+        super().__init__(app)
+        self.timeout = timeout
+
+    async def dispatch(self, request, call_next):
+        try:
+            return await asyncio.wait_for(call_next(request), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            logger.error(f"Request timed out after {self.timeout} seconds")
+            return Response(
+                content={"detail": f"Request timed out after {self.timeout} seconds"},
+                status_code=504
+            )
+
 app = FastAPI()
 
-# Add CORS middleware
+# Add middleware
+app.add_middleware(TimeoutMiddleware, timeout=60)  # 60 second timeout
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -245,17 +266,8 @@ def analyze_food_image(image: np.ndarray) -> dict:
         logger.error(f"Error analyzing food image: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error analyzing food image: {str(e)}")
 
-@app.post("/analyze")
-async def analyze_image(file: UploadFile = File(...)):
+async def process_image_async(image_data: bytes) -> dict:
     try:
-        logger.info(f"Received image: {file.filename}")
-        start_time = time.time()
-        
-        # Read image data
-        image_data = await file.read()
-        if not image_data:
-            raise HTTPException(status_code=400, detail="Empty image file")
-            
         # Preprocess image
         image_array = preprocess_image(image_data)
         
@@ -266,18 +278,72 @@ async def analyze_image(file: UploadFile = File(...)):
         # Analyze image
         result = analyze_food_image(image_array)
         
-        logger.info(f"Analysis completed in {time.time() - start_time:.2f} seconds")
         return result
+    except Exception as e:
+        logger.error(f"Error processing image: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/analyze")
+async def analyze_image(file: UploadFile = File(...)):
+    try:
+        logger.info(f"Received image: {file.filename}")
+        start_time = time.time()
         
+        # Read image data
+        image_data = await file.read()
+        if not image_data:
+            raise HTTPException(status_code=400, detail="Empty image file")
+        
+        # Process image with timeout
+        try:
+            result = await asyncio.wait_for(
+                process_image_async(image_data),
+                timeout=55  # Slightly less than middleware timeout
+            )
+            
+            logger.info(f"Analysis completed in {time.time() - start_time:.2f} seconds")
+            return result
+            
+        except asyncio.TimeoutError:
+            logger.error("Image processing timed out")
+            raise HTTPException(status_code=504, detail="Image processing timed out")
+            
     except HTTPException as he:
         raise he
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+@app.get("/")
+async def root():
+    return {
+        "name": "Food Analysis API",
+        "version": "1.0.0",
+        "endpoints": {
+            "/": "API information (this endpoint)",
+            "/health": "Health check endpoint",
+            "/analyze": "Analyze food image (POST)"
+        },
+        "description": "API for analyzing food images to detect spoilage and identify food items"
+    }
+
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy"}
+    try:
+        # Check if model is loaded
+        model_loaded = model is not None
+        return {
+            "status": "healthy",
+            "model_loaded": model_loaded,
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {str(e)}")
+        return {
+            "status": "unhealthy",
+            "error": str(e),
+            "timestamp": time.time()
+        }
 
 if __name__ == "__main__":
     import uvicorn
