@@ -7,10 +7,27 @@ from PIL import Image
 import io
 import logging
 import time
+import gc
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Configure TensorFlow to use less memory
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        logger.warning(f"GPU memory growth setting failed: {e}")
+
+# Limit TensorFlow memory usage
+tf.config.set_logical_device_configuration(
+    tf.config.list_physical_devices('CPU')[0],
+    [tf.config.LogicalDeviceConfiguration(memory_limit=512)]  # Limit to 512MB
+)
 
 app = FastAPI()
 
@@ -32,12 +49,16 @@ def load_model():
     if model is None:
         logger.info("Loading model...")
         start_time = time.time()
-        model = hub.load("https://tfhub.dev/google/aiy/vision/classifier/food_V1/1")
-        class_names = model.class_names
-        logger.info(f"Model loaded in {time.time() - start_time:.2f} seconds")
+        try:
+            model = hub.load("https://tfhub.dev/google/aiy/vision/classifier/food_V1/1")
+            class_names = model.class_names
+            logger.info(f"Model loaded in {time.time() - start_time:.2f} seconds")
+        except Exception as e:
+            logger.error(f"Error loading model: {str(e)}")
+            raise HTTPException(status_code=500, detail="Failed to load model")
     return model, class_names
 
-def preprocess_image(image_data: bytes, max_size: int = 1024) -> np.ndarray:
+def preprocess_image(image_data: bytes, max_size: int = 512) -> np.ndarray:  # Reduced max size
     try:
         # Open image from bytes
         image = Image.open(io.BytesIO(image_data))
@@ -55,6 +76,10 @@ def preprocess_image(image_data: bytes, max_size: int = 1024) -> np.ndarray:
         
         # Convert to numpy array and normalize
         image_array = np.array(image) / 255.0
+        
+        # Clear memory
+        del image
+        gc.collect()
         
         # Add batch dimension
         image_array = np.expand_dims(image_array, axis=0)
@@ -88,6 +113,10 @@ def analyze_image_quality(image: np.ndarray) -> dict:
         # Detect unusual colors (high variance in color channels)
         unusual_colors = np.mean(color_variance > 0.1) * 100
         
+        # Clear memory
+        del gray, max_color, min_color
+        gc.collect()
+        
         return {
             "saturation": float(saturation),
             "brightness": float(brightness),
@@ -117,6 +146,10 @@ def analyze_food_image(image: np.ndarray) -> dict:
             for idx in top_3_idx
         ]
         
+        # Clear memory
+        del predictions
+        gc.collect()
+        
         # Get image quality metrics
         quality_metrics = analyze_image_quality(image)
         
@@ -145,6 +178,10 @@ def analyze_food_image(image: np.ndarray) -> dict:
             recommendations.append("Unusual discoloration detected")
         if quality_metrics["color_variance"] > 0.15:
             recommendations.append("Color appears inconsistent")
+            
+        # Clear memory
+        del image
+        gc.collect()
             
         return {
             "isSafe": is_safe,
@@ -195,6 +232,10 @@ async def analyze_image(file: UploadFile = File(...)):
             
         # Preprocess image
         image_array = preprocess_image(image_data)
+        
+        # Clear memory
+        del image_data
+        gc.collect()
         
         # Analyze image
         result = analyze_food_image(image_array)
